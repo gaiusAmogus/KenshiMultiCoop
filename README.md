@@ -1,4 +1,11 @@
-# KenshiCoop
+# KenshiMultiCoop
+
+This repository contains our modified version of KenshiCoop. 
+Our primary goal was to extend the original mod to support additional players while preserving its core functionality. 
+Original repository: https://github.com/nhoral/KenshiCoop
+
+
+################
 
 Setup + Demo: [https://www.youtube.com/watch?v=OqwVRRZEYGM](https://www.youtube.com/watch?v=OqwVRRZEYGM)
 
