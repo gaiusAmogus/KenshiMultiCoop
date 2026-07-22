@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/sync/DriveTaper.h"    // walk-drive deceleration taper (pure inline)
 #include "../plugin/core/CarriedHeal.h"  // owner-side carried self-heal (16b)
 #include "../plugin/core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
 #include "../plugin/core/StatusAutohide.h" // status-banner auto-hide policy (pure inline)
@@ -1600,6 +1601,40 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// Walk-drive deceleration taper (on-stop overshoot/snap-back fix). The taper is
+// the load-bearing pure fraction the drive multiplies lead/catch-up/cap by as the
+// source decelerates; locking its clamp + monotonicity here proves the "converge
+// to the stop, don't overrun" contract without a game launch.
+static void testDriveTaper() {
+    std::printf("\n== walk-drive deceleration taper ==\n");
+    using coop::driveSpeedTaper;
+
+    const float REF = 6.0f; // CATCHUP_REF_SPEED
+
+    // Full strength at/above the reference cruise speed (clamped high).
+    CHECK("at cruise = 1",       driveSpeedTaper(6.0f, REF) == 1.0f);
+    CHECK("above cruise = 1",    driveSpeedTaper(50.0f, REF) == 1.0f);
+    // Zero at a full stop (the whole point: no lead/catch-up push past the mark).
+    CHECK("at stop = 0",         driveSpeedTaper(0.0f, REF) == 0.0f);
+    // Linear in between: half the reference speed -> half strength.
+    CHECK("half speed = 0.5",    driveSpeedTaper(3.0f, REF) == 0.5f);
+    // Negative velocity noise clamps to 0 (never a negative cap/lead).
+    CHECK("negative clamps to 0", driveSpeedTaper(-2.0f, REF) == 0.0f);
+    // Monotonic non-decreasing as speed rises (a faster source never tapers more).
+    CHECK("monotonic 1<2u",      driveSpeedTaper(1.0f, REF) < driveSpeedTaper(2.0f, REF));
+    CHECK("monotonic 2<5u",      driveSpeedTaper(2.0f, REF) < driveSpeedTaper(5.0f, REF));
+    // Defensive: a non-positive reference disables the taper (full strength) so a
+    // mis-tuned constant can never freeze the drive at 0.
+    CHECK("zero ref = full",     driveSpeedTaper(3.0f, 0.0f) == 1.0f);
+    CHECK("neg ref = full",      driveSpeedTaper(3.0f, -1.0f) == 1.0f);
+
+    // The cap formula the drive uses: base * (1 + 1.5*frac) spans 1x (stop) to
+    // 2.5x (cruise) - guard the endpoints so the "2.5x cruise -> 1x stop" intent
+    // can't silently drift if the taper shape ever changes.
+    CHECK("cap 1x at stop",   (1.0f + 1.5f * driveSpeedTaper(0.0f, REF)) == 1.0f);
+    CHECK("cap 2.5x cruise",  (1.0f + 1.5f * driveSpeedTaper(6.0f, REF)) == 2.5f);
+}
+
 // ---- 12. Owner-side carried self-heal debounce (CarriedHeal.h) ------------------
 // Guards the SYNC_GAPS 16b fix: the owner of a carried body reconciles its LOCAL
 // isBeingCarried against the carrier's streamed TASK_CARRY_BODY claim. The step
@@ -1794,6 +1829,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testDriveTaper();
     testRoundTrips();
     testFraming();
     testSaveCrc();
