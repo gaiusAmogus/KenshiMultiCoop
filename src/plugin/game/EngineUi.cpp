@@ -105,6 +105,19 @@ void markerDestroy(void* label) {
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 
+// True while any inventory/trade window is open. Callers defer inventory
+// mutation so the reconcile never frees an Item the open UI still holds
+// (Inventory::removeItem UAF, crash on entering cities/shops).
+bool inventoryUiOpen() {
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return false;
+    __try {
+        return g->getNumOpenInventoryWindows() > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
 // A native DatapanelGUI window toggled with F2. The player picks role + transport
 // (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;
@@ -195,12 +208,12 @@ struct CoopPanelUi {
     bool          lastChkVal;    // last toggle value (connect/disconnect edge)
     bool          needsRebuild;
     bool          f2Down;        // F2 held last tick (rising-edge toggle)
-    bool          syncRequested; // host clicked "Synchronize" -> force a resend pass
     std::string   lastStatus;    // last status text shown (refresh gate)
+    std::string   lastTransfer;  // last save-transfer line shown (refresh gate)
     CoopPanelUi()
         : panel(0), open(false), built(false), hostFlag(true), steamFlag(true),
           connectedFlag(false), lastConnected(false), lastChkVal(false),
-          needsRebuild(false), f2Down(false), syncRequested(false) {}
+          needsRebuild(false), f2Down(false) {}
 };
 
 CoopPanelUi             g_panel;
@@ -209,7 +222,6 @@ DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
 DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
-DataPanelLine_Button*   g_syncBtn      = 0; // host-only "Synchronize" force-resend button
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
 DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
@@ -242,15 +254,6 @@ void onConnBtn(DataPanelLine*) {
     g_panel.needsRebuild = true;
     coop::logLine(g_panel.connectedFlag ? "[coop-ui] connection -> ONLINE"
                                         : "[coop-ui] connection -> OFFLINE");
-}
-// "Synchronize" (host only): request a one-shot force-resend of every
-// change-gated channel (the same pass the connect-edge resync runs), so a
-// mid-session desync can be re-pushed to the joins without disconnecting. The
-// callback only sets a flag; the actual resend runs in coopPanelTick where the
-// Replicator/NetLink are in scope. Idempotent - repeated clicks just re-push.
-void onSyncBtn(DataPanelLine*) {
-    g_panel.syncRequested = true;
-    coop::logLine("[coop-ui] SYNC requested (host force-resend)");
 }
 // Copy the player's own SteamID to the clipboard so they can paste it to a friend
 // (who pastes it into their panel via "Paste friend's Steam ID").
@@ -294,7 +297,6 @@ struct PanelStrings {
     const std::string *dbgKey, *dbgVal;
     const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
-    const std::string *syncKey, *syncCap; // host-only "Synchronize" button (0 = hide)
     const std::string *empty;
 };
 
@@ -305,10 +307,6 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         g_roleBtn  = p->setLineButton(*s->roleKey,  *s->roleCap,  0);
         g_transBtn = p->setLineButton(*s->transKey, *s->transCap, 0);
         g_connBtn  = p->setLineButton(*s->connKey,  *s->connCap,  0);
-        // Host-only "Synchronize" button (force-resend). syncKey is 0 when we are
-        // not a connected host, so the row simply doesn't appear for joins/offline.
-        g_syncBtn = (s->syncKey && s->syncCap)
-                    ? p->setLineButton(*s->syncKey, *s->syncCap, 0) : 0;
         p->addSpace(0, 0.35f);
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
@@ -323,15 +321,18 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// Colour a line's key + value TextBoxes white for readability. Runs AFTER
+// Colour a line's key + value TextBoxes for readability. Runs AFTER
 // panelBuildSeh's _NV_update (the w1/w2 widgets exist by then). MyGUI::Colour is a
 // trivial 4-float struct (no destructor), so it may live in the SEH frame.
-void dbgColourSeh(DataPanelLine* line) {
+// yellow=true tints the value column amber - used for the join's live
+// "Streaming host world..." transfer line so it reads as in-progress activity.
+void dbgColourSeh(DataPanelLine* line, bool yellow) {
     if (!line) return;
     __try {
         MyGUI::Colour white(1.0f, 1.0f, 1.0f, 1.0f);
+        MyGUI::Colour amber(1.0f, 0.82f, 0.20f, 1.0f);
         if (line->w1) line->w1->setTextColour(white);
-        if (line->w2) line->w2->setTextColour(white);
+        if (line->w2) line->w2->setTextColour(yellow ? amber : white);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -361,7 +362,7 @@ void panelDestroySeh(ForgottenGUI* g, DatapanelGUI* p) {
 } // namespace
 
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect, CoopSyncFn onSync) {
+                   CoopDisconnectFn onDisconnect) {
     if (!st) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     { static void* s_last = (void*)-1;
@@ -420,6 +421,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     std::string detail = st->detail ? std::string(st->detail) : std::string();
     if (detail != g_panel.lastStatus) g_panel.needsRebuild = true;
 
+    // Join save-transfer line (throttled to whole-percent by the caller): rebuild
+    // when it changes so the "Streaming host world... NN%" line advances live.
+    std::string transfer = st->transferDetail ? std::string(st->transferDetail)
+                                               : std::string();
+    if (transfer != g_panel.lastTransfer) g_panel.needsRebuild = true;
+
     // Create the window once (outside SEH - see the header note on C2712).
     // Layer MUST be "Info": spike 48 proved createFloatingLabel renders non-null
     // there. "Windows" is not a visible MyGUI layer here - the panel is minted
@@ -462,6 +469,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             dbgVal = std::string("Offline - will ") + (g_panel.hostFlag ? "host" : "join") +
                      " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
         }
+        // A join streaming the host's world at the menu has no leader for the
+        // screen overlay, so surface the live progress here instead (amber).
+        if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
 
         // Friend's SteamID: prefer the value pasted in-panel this session; fall
         // back to the config (steamPeer, mainly for advanced/back-compat use).
@@ -493,13 +503,6 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string selfVal  = selfBuf;
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
-        // Host-only "Synchronize" button: force a resend of the host's world state
-        // to all joins, to repair a mid-session desync without disconnecting. Only
-        // shown for a HOST that is actually online (a join can't push the host's
-        // world; offline there is nothing to resend).
-        std::string syncKey  = "syncstate";
-        std::string syncCap  = "Synchronize (resend world)";
-        bool showSync = st->running && st->isHost;
         std::string empty    = "";
 
         PanelStrings ps;
@@ -511,8 +514,6 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
-        ps.syncKey = showSync ? &syncKey : 0;
-        ps.syncCap = showSync ? &syncCap : 0;
         ps.empty = &empty;
         panelBuildSeh(g_panel.panel, &ps);
 
@@ -524,14 +525,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
-        if (g_syncBtn)    g_syncBtn->callback    = MyGUI::newDelegate(&onSyncBtn);
-        dbgColourSeh(g_debugLine);
-        dbgColourSeh(g_peerLine);
-        dbgColourSeh(g_selfLine);
+        dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
+        dbgColourSeh(g_peerLine, false);
+        dbgColourSeh(g_selfLine, false);
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
         g_panel.lastStatus = detail;
+        g_panel.lastTransfer = transfer;
     }
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so
@@ -551,19 +552,6 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
             if (onDisconnect) onDisconnect();
-        }
-    }
-
-    // "Synchronize" (host force-resend): route the queued request up to the
-    // plugin root, which owns the Replicator/NetLink. Guarded to a running host
-    // so a stale flag can never fire off-session. One-shot: cleared after firing.
-    if (g_panel.syncRequested) {
-        g_panel.syncRequested = false;
-        if (st->running && st->isHost && onSync) {
-            coop::logLine("[coop-ui] SYNC firing (host world resend)");
-            onSync();
-        } else {
-            coop::logLine("[coop-ui] SYNC ignored (not a running host)");
         }
     }
 }

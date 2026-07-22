@@ -39,19 +39,20 @@ Replicator::Replicator()
       nextDropId_(1), nextPickupId_(1), nextXferId_(1),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
-      dmgGuard_(false), carrySync_(true), furnSync_(true), chainSync_(true),
+      dmgGuard_(false), reportCombat_(false), nextHitId_(1),
+      carrySync_(true), furnSync_(true), chainSync_(true),
       stealthSync_(true),
       gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
       camHintSendMs_(0), peerCamMs_(0),
-      midCursor_(0), midSliceMs_(0), activePeerCount_(1), capLogMs_(0),
+      midCursor_(0), midSliceMs_(0),
       censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
-      speedLastApplied_(-1.0f), speedMyReq_(-1.0f),
-      speedMyCombat_(false), speedLastSet_(-1.0f),
-      speedSeqOut_(1), speedJoinSetSeqSeen_(0),
+      speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
+      speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
+      speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
@@ -160,6 +161,7 @@ void Replicator::resetSession() {
     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
+    mintedProxies_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;
@@ -244,10 +246,11 @@ void Replicator::resetSession() {
     // save's speed becomes the new baseline; the join's slew re-measures).
     speedLastApplied_ = -1.0f;
     speedMyReq_       = -1.0f;
+    speedPeerReq_     = -1.0f;
     speedMyCombat_    = false;
-    speedPeers_.clear();
-    speedJoinSetSeqSeen_ = 0;
+    speedPeerCombat_  = false;
     speedLastSet_     = -1.0f;
+    speedSeqSeen_     = 0;
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
@@ -276,7 +279,8 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     unsigned int cleared = 0;
     for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
          it != proxyByKey_.end(); ++it) {
-        if (gw && it->second && engine::despawnProxyNpc(gw, it->second))
+        if (gw && it->second && mintedProxies_.count(it->second) &&
+            engine::despawnProxyNpc(gw, it->second))
             ++cleared;
     }
     char b[96];

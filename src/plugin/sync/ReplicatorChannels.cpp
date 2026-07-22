@@ -361,6 +361,72 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
     }
 }
 
+// JOIN only (protocol 45): forward the join-dealt damage that applyTargets drained
+// into pendingHits_ (per driven world-NPC copy, keyed by canonical hand). The
+// join's own melee is guarded (cosmetic), so this reliable report is the ONLY path
+// by which the join PC actually wounds the host's authoritative NPC. Sent as it
+// accumulates; the map is cleared each publish (unsent-on-drop is acceptable - the
+// next swing re-accumulates, and RELIABLE delivery covers a queued send).
+void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (pendingHits_.empty()) return;
+    for (std::map<Key, PendingHit>::iterator it = pendingHits_.begin();
+         it != pendingHits_.end(); ++it) {
+        const Key&       k  = it->first;
+        const PendingHit& ph = it->second;
+        if (ph.flesh <= 0.0f && ph.blood <= 0.0f) continue;
+        CombatHitPacket chp;
+        memset(&chp, 0, sizeof(chp));
+        chp.type    = (u8)PKT_COMBAT_HIT;
+        chp.ownerId = ownerId;
+        chp.hitId   = nextHitId_++;
+        chp.sType = k.t; chp.sContainer = k.c; chp.sContainerSerial = k.cs;
+        chp.sIndex = k.i; chp.sSerial = k.s;
+        chp.flesh = ph.flesh; chp.blood = ph.blood;
+        net.queueCombatHit(chp);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f",
+            chp.hitId, k.i, k.s, ph.flesh, ph.blood);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    pendingHits_.clear();
+}
+
+// HOST only (protocol 45): drain received join-dealt damage reports and wound the
+// authoritative world NPC (blood loss + a frontal flesh wound). The host owns +
+// simulates world NPCs, so this is the authoritative application; the vitals
+// stream then mirrors the new state back to the join's cosmetic copy. A report for
+// a body the host OWNS as a player-squad member is skipped (PvP is out of scope
+// and would be a partition error, mirroring applyTreatments' authority guard).
+void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
+    std::deque<InboundCombatHit> got;
+    in.drainCombatHits(got);
+    for (std::deque<InboundCombatHit>::iterator it = got.begin(); it != got.end(); ++it) {
+        const CombatHitPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        if (ownHands_.find(k) != ownHands_.end()) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body)",
+                p.hitId, k.i, k.s);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
+        // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
+        // back to the join's cosmetic copy (link 6 - "damage reached the join").
+        // The join's own copy is damage-guarded, so without this stream it would
+        // never reflect the host-applied wound.
+        if (applied && streamNpcs_) medNpc_[k] = nowMs();
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
+            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
     (void)gw;
     const unsigned long RESEND_MS   = 5000; // safety resend (cheap insurance)
@@ -392,16 +458,20 @@ void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
             pkt.stats[i] = (i < n) ? sr.stats[i] : -1.0f;
         pkt.xp                  = sr.xp;
         pkt.freeAttributePoints = sr.freeAttribPts;
+        {
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            pkt.age = c ? engine::charAge(c) : -1.0f;
+        }
         net.queueStats(pkt);
         if (changed) { // periodic resends stay silent; changes are the signal
             // str/dex/tough/stealth/athletics cover the scenario + the stats a
             // player watches; the full vector is in the packet regardless.
             // StatsEnumerated: STRENGTH=1 STEALTH=16 ATHLETICS=17 DEXTERITY=18
             // TOUGHNESS=21 (Enums.h).
-            char b[200]; _snprintf(b, sizeof(b) - 1,
-                "[stats] SEND hand=%u,%u str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f fap=%.0f",
+            char b[224]; _snprintf(b, sizeof(b) - 1,
+                "[stats] SEND hand=%u,%u str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f fap=%.0f age=%.2f",
                 k.i, k.s, sr.stats[1], sr.stats[18], sr.stats[21], sr.stats[16],
-                sr.stats[17], sr.xp, sr.freeAttribPts);
+                sr.stats[17], sr.xp, sr.freeAttribPts, pkt.age);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -433,10 +503,16 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         w.xp            = p.xp;
         w.freeAttribPts = p.freeAttributePoints;
         bool ok = engine::writeStats(c, w);
-        char b[200]; _snprintf(b, sizeof(b) - 1,
-            "[stats] RECV hand=%u,%u ok=%d str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f",
+        // Animal-scale sync (protocol 46): apply the owner's age only when it
+        // has drifted, so a growing squad animal matches size on the peer.
+        if (p.age > 0.0f && p.age < 1.0e6f) {
+            float cur = engine::charAge(c);
+            if (cur < 0.0f || fabs(cur - p.age) > 0.01f) engine::setCharAge(c, p.age);
+        }
+        char b[224]; _snprintf(b, sizeof(b) - 1,
+            "[stats] RECV hand=%u,%u ok=%d str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f age=%.2f",
             k.i, k.s, ok ? 1 : 0, p.stats[1], p.stats[18], p.stats[21],
-            p.stats[16], p.stats[17], p.xp);
+            p.stats[16], p.stats[17], p.xp, (ok ? engine::charAge(c) : p.age));
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1674,14 +1750,8 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
     // Phase 5 spike: expose the combat-cap state so the speed-setter
     // diagnostics (KENSHICOOP_DEBUG_SPEED) can distinguish an engine-forced
-    // combat cap from a user click by context. Combat across peers now lives in
-    // the per-peer speedPeers_ map (3-player generalization of the old single
-    // speedPeerCombat_ bit), so OR my flag with ANY connected peer's combat.
-    bool anyPeerCombat = false;
-    for (std::map<u32, PeerSpeed>::iterator pc = speedPeers_.begin();
-         pc != speedPeers_.end() && !anyPeerCombat; ++pc)
-        if (pc->second.combat) anyPeerCombat = true;
-    engine::setSpeedCombatHint(speedMyCombat_ || anyPeerCombat);
+    // combat cap from a user click by context.
+    engine::setSpeedCombatHint(speedMyCombat_ || speedPeerCombat_);
 
     // Local vote capture: the engine-setter hooks (setGameSpeed / userPause /
     // togglePause) record every REAL user action - UI clicks, keyboard pause,
@@ -1714,46 +1784,30 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Drain peer speed packets: the host keeps EACH join's latest REQUEST (per
-    // ownerId slot); the join applies the host's arbitrated SET. The reliable
-    // channel is ordered, but a per-peer seq guard keeps a (theoretical) stale
-    // packet from rolling back - and, with two joins, keeps one join's packets
-    // from being rejected against the other join's seq.
+    // Drain peer speed packets: the host keeps the join's latest REQUEST; the
+    // join applies the host's arbitrated SET. The reliable channel is ordered,
+    // but the seq guard keeps a (theoretical) stale packet from rolling back.
     std::deque<InboundSpeed> got;
     in.drainSpeed(got);
-    // Join-side SET stale guard: the join has a single stream (from the host),
-    // so one newest-seq is correct here. Instance member speedJoinSetSeqSeen_
-    // (reset in resetSession) - NOT a function static, which would survive a
-    // reconnect and wrongly reject the host's post-reconnect lower seq as stale.
     for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
         const SpeedPacket& p = it->pkt;
+        if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
+            continue;
+        speedSeqSeen_ = p.seq;
         bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
         if (p.type == (u8)PKT_SPEED_REQ && isHost) {
-            // Per-peer stale guard: compare seq against THIS peer's last accepted
-            // seq, not a global one (else two joins reject each other's packets).
-            std::map<u32, PeerSpeed>::iterator ps = speedPeers_.find(it->ownerId);
-            if (ps != speedPeers_.end() && p.seq != 0 && ps->second.seqSeen != 0 &&
-                (long)(p.seq - ps->second.seqSeen) <= 0)
-                continue; // stale
             float req = pkPaused ? 0.0f : p.speed;
             bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
-            bool changed = (ps == speedPeers_.end() ||
-                            fabs(req - ps->second.req) > EPS ||
-                            cmb != ps->second.combat);
-            if (changed) {
+            if (speedPeerReq_ < 0.0f || fabs(req - speedPeerReq_) > EPS ||
+                cmb != speedPeerCombat_) {
                 char b[112]; _snprintf(b, sizeof(b) - 1,
                     "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
                     (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
-            PeerSpeed slot;
-            slot.req = req; slot.combat = cmb; slot.seqSeen = p.seq;
-            speedPeers_[it->ownerId] = slot;
+            speedPeerReq_    = req;
+            speedPeerCombat_ = cmb;
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
-            if (p.seq != 0 && speedJoinSetSeqSeen_ != 0 &&
-                (long)(p.seq - speedJoinSetSeqSeen_) <= 0)
-                continue; // stale
-            speedJoinSetSeqSeen_ = p.seq;
             // QUIET apply: drives the sim to the arbitrated effective without
             // touching the UI buttons - they keep showing this player's VOTE.
             // The clock slew (protocol 25) folds in here: the join's sim runs
@@ -1775,21 +1829,12 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
     }
 
     if (isHost) {
-        // Arbitrate: effective = min(my request, EVERY peer's request), capped at
-        // 1x while any player squad fights. The cap never force-unpauses -
-        // pause (0) is already below 1, so min semantics preserve it. With 3
-        // players the slowest of all wins (any one pausing pauses the world).
+        // Arbitrate: effective = min(my request, peer request), capped at 1x
+        // while either player squad fights. The cap never force-unpauses -
+        // pause (0) is already below 1, so min semantics preserve it.
         float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
-        bool combat = speedMyCombat_;
-        float loggedPeerMin = -1.0f; // for the SET log's peer= field
-        for (std::map<u32, PeerSpeed>::iterator sit = speedPeers_.begin();
-             sit != speedPeers_.end(); ++sit) {
-            if (sit->second.req >= 0.0f && sit->second.req < eff) eff = sit->second.req;
-            if (sit->second.req >= 0.0f &&
-                (loggedPeerMin < 0.0f || sit->second.req < loggedPeerMin))
-                loggedPeerMin = sit->second.req;
-            if (sit->second.combat) combat = true;
-        }
+        if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
+        bool combat = speedMyCombat_ || speedPeerCombat_;
         if (combat && eff > 1.0f) eff = 1.0f;
         bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
         // userActed with an UNCHANGED effective = a denied raise (consensus
@@ -1816,7 +1861,7 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
                 char b[128]; _snprintf(b, sizeof(b) - 1,
                     "[speed] SET mult=%.2f paused=%d combat=%d (my=%.2f peer=%.2f)",
                     eff, effPaused ? 1 : 0, combat ? 1 : 0,
-                    speedMyReq_, loggedPeerMin);
+                    speedMyReq_, speedPeerReq_);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
