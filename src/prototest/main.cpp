@@ -913,6 +913,38 @@ static void testOwnRanks() {
         resolveOwnRanks(r, false, fromEnv);       // no env -> JOIN default {1}
         CHECK("empty env -> JOIN default {1}", !fromEnv && ranksAre(r, 1, -1));
     }
+
+    // 3-player generalization: rank == playerId. Host=0, join#1=1, join#2=2.
+    {
+        std::set<unsigned int> r;
+        resolveOwnRanksForPlayer(r, 0u, false);
+        CHECK("playerId 0 owns {0}", ranksAre(r, 0, -1));
+        r.clear();
+        resolveOwnRanksForPlayer(r, 1u, false);
+        CHECK("playerId 1 owns {1}", ranksAre(r, 1, -1));
+        r.clear();
+        resolveOwnRanksForPlayer(r, 2u, false);
+        CHECK("playerId 2 owns {2}", ranksAre(r, 2, -1));
+    }
+    // The isHost wrapper must stay byte-identical to the old behavior.
+    {
+        std::set<unsigned int> a, b;
+        resolveOwnRanks(a, true, false);
+        resolveOwnRanksForPlayer(b, 0u, false);
+        CHECK("wrapper host == playerId 0", a == b);
+        a.clear(); b.clear();
+        resolveOwnRanks(a, false, false);
+        resolveOwnRanksForPlayer(b, 1u, false);
+        CHECK("wrapper join == playerId 1", a == b);
+    }
+    // fromEnv override is preserved regardless of playerId.
+    {
+        std::set<unsigned int> r;
+        r.insert(5u);
+        resolveOwnRanksForPlayer(r, 2u, true);
+        CHECK("playerId 2 env-override preserved", ranksAre(r, 5, -1));
+    }
+
 }
 
 // ---- 7. SteamID64 parse (SteamId.h) ---------------------------------------------
