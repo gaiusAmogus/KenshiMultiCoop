@@ -45,14 +45,6 @@ public:
     // Stage 4: also stream nearby host-authoritative world NPCs (host side).
     void setStreamNpcs(bool v) { streamNpcs_ = v; }
 
-    // Number of remote players currently connected (host: joins; join: 1 = host).
-    // Set from Plugin's connected-peer set each session change. Used to scale the
-    // mid-band NPC streaming quota so per-NPC refresh rate does not collapse when
-    // more players (=> more squads in motion => more nearby NPCs) share the same
-    // fixed quota. Clamped to >=1; at 1 (the 2-player case) all derived limits are
-    // byte-identical to the pre-3-player behaviour.
-    void setActivePeerCount(unsigned int n) { activePeerCount_ = (n < 1u) ? 1u : n; }
-
     // Protocol 36 live-tuning knobs (KENSHICOOP_INTERP_* / _CATCHUP_K /
     // _SNAP_DIST): override the interp buffer's delay/extrapolation window and
     // the walk-drive's hard-snap / catch-up gains for WAN A/B runs without a
@@ -282,6 +274,21 @@ public:
     // stream then mirrors the healed state back to everyone.
     void applyTreatments(GameWorld* gw, Inbound& in);
 
+    // JOIN only (protocol 45): forward the join-dealt damage accumulated on driven
+    // world-NPC copies (drained into pendingHits_ during applyTargets) to the host
+    // as reliable CombatHitPackets. The join's local swing is guarded (cosmetic),
+    // so this is the only path by which the join PC actually wounds the host's NPC.
+    void publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // HOST only (protocol 45): drain received join-dealt damage reports and apply
+    // them AUTHORITATIVELY to the world NPC the host owns (blood loss + a frontal
+    // flesh wound via woundSubjectLimbs). Ignores reports for bodies the host is
+    // not the combat authority for (partition safety, like applyTreatments).
+    void applyCombatHits(GameWorld* gw, Inbound& in);
+
+    // Enable join-dealt damage reporting (join only; see publishCombatHits).
+    void setReportCombat(bool v) { reportCombat_ = v; }
+
     // AFTER publishOwned (protocol 17, both clients): stream each OWNED
     // player-squad member's CharStats (attributes/skills/xp) on the RELIABLE
     // channel - change-gated by a quantized fingerprint, ~1 Hz floor, periodic
@@ -492,12 +499,6 @@ public:
     // baseline is not traffic. Edge-only caches (weaponCensus_, hostBody_)
     // are deliberately untouched: re-seeding would author phantom edges.
     void onPeerConnected(NetLink& net, u32 ownerId);
-
-    // A peer disconnected (leave edge). Drop any per-peer state keyed by its
-    // ownerId so a departed player can't keep influencing the session. Notably
-    // its game-speed request must leave the min() arbitration, else a peer that
-    // left while paused would pin the world at pause for everyone remaining.
-    void onPeerLeft(u32 ownerId) { speedPeers_.erase(ownerId); }
 
     // AFTER publishOwned (protocol 20, HOST only - the world-detection
     // authority): for every DRIVEN copy currently in stealth mode, read its
@@ -932,10 +933,6 @@ private:
     unsigned long             midSliceMs_; // last slice advance (50 ms cadence:
                                            // the slice must persist across a
                                            // whole net tick to be sampled)
-    unsigned int              activePeerCount_; // remote players connected (>=1);
-                                               // scales the mid-band quota so 3
-                                               // players don't starve NPC refresh
-    unsigned long             capLogMs_;   // last "[publish] AT CAP" log (~1 Hz throttle)
     // v38 census position parking (pack-hidden investigation, 2026-07-11):
     // the host position per census row. A census-PRESENT NPC is exempt from
     // culling, but its two locally-simulated copies can wander arbitrarily
@@ -1241,6 +1238,16 @@ private:
 
     // Damage-guard state (join side): suppress local melee damage on driven bodies.
     bool                 dmgGuard_;
+
+    // Join-dealt authoritative damage report (protocol 45). reportCombat_ is set on
+    // the JOIN only; while ON, applyTargets drains the guard's accumulated per-copy
+    // damage into pendingHits_ (keyed by the copy's canonical hand), and
+    // publishCombatHits forwards it to the host. nextHitId_ is a per-sender counter
+    // for log correlation.
+    struct PendingHit { float flesh; float blood; PendingHit() : flesh(0.0f), blood(0.0f) {} };
+    bool                 reportCombat_;
+    std::map<Key, PendingHit> pendingHits_;
+    unsigned int         nextHitId_;
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
@@ -1583,19 +1590,12 @@ private:
     // can pause, both must raise"). -1 = not yet known.
     float         speedLastApplied_;   // what WE last wrote (own-write vs user-click detector)
     float         speedMyReq_;         // this client's current request
+    float         speedPeerReq_;       // host only: the join's latest request (-1 = none yet)
     bool          speedMyCombat_;      // own-squad in-combat flag (~1 Hz sample)
-    // host only: each peer's latest speed request + combat bit + newest accepted
-    // seq (per-peer stale guard). Keyed by ownerId. Two joins each hold a slot,
-    // so neither evicts the other; arbitration takes min() over all slots.
-    struct PeerSpeed { float req; bool combat; u32 seqSeen; };
-    std::map<u32, PeerSpeed> speedPeers_;
+    bool          speedPeerCombat_;    // host only: the join's reported combat bit
     float         speedLastSet_;       // host: last broadcast effective; join: last received
     u32           speedSeqOut_;        // per-sender monotonic seq for REQ/SET we send
-    u32           speedJoinSetSeqSeen_;// join: newest SET seq accepted from the host
-                                       // (single host stream). Instance member (not a
-                                       // function static) so resetSession() zeroes it
-                                       // on a reconnect - else a lower post-reconnect
-                                       // host seq would be wrongly rejected as stale.
+    u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
     unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
@@ -1638,6 +1638,12 @@ private:
     // syncSpawns runs a ~1 s liveness sweep: SEH-read each pointer's current
     // hand and resolve it back; anything but the same pointer unbinds the
     // entry untouched.
+    // Minted-proxy discriminator (keyed by pointer): only bodies WE created via
+    // spawnProxyNpc may be destroyed on cleanup. rekeyPeerBody also binds REAL
+    // save-stable bodies into proxyByKey_ (a recruit/squad-move rebind), and
+    // destroying one on peer-leave crashes (freed body still in playerCharacters)
+    // and bakes it out of the save. Membership survives key migration for free.
+    std::set<Character*> mintedProxies_;
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).
