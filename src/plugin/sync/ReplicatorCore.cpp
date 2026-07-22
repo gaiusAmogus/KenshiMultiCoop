@@ -65,6 +65,7 @@ Replicator::Replicator()
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
+      bountySeqOut_(1), bountySampleMs_(0), bountySync_(true), bountyBaseline_(false),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
@@ -191,6 +192,7 @@ void Replicator::resetSession() {
     peerCamMs_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
+    ownCarriedNoSee_.clear(); // 16b owner-side carry heal: old world's anchors
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();
@@ -224,7 +226,7 @@ void Replicator::resetSession() {
     medPub_.clear();
     medRecv_.clear();
     medNpc_.clear();
-    statsPub_.clear();
+    factionMoney_ = coop::MoneyState(); // re-seed the shared-wallet baseline on load
     moneyPub_.clear();
     stealthPub_.clear();
     pinOwned_.clear();

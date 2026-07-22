@@ -25,6 +25,7 @@
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
+#include "../core/MoneyReconcile.h"
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
@@ -212,6 +213,13 @@ public:
     // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
 
+    // Auto-revert mitigation (W1 non-gear pickup dupe): if a PEER picked up one of
+    // our tracked ground proxies (a real, unowned, pickable object), re-drop it to
+    // the ground before the inventory publish so the peer never retains (and never
+    // mirrors back) a second copy of the authoring client's real item. NOT full
+    // pickup conservation (Phase W4) - it prevents the dupe + keeps the drop visible.
+    void revertProxyPickups(GameWorld* gw);
+
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
     // owned inventories ourselves) - author a reliable DROP intent at the owner position (the
@@ -302,16 +310,16 @@ public:
     // fights accumulate locally (the owner's stream overwrites it).
     void applyStats(GameWorld* gw, Inbound& in);
 
-    // AFTER publishOwned (protocol 22, both clients): stream the WALLET
-    // (Ownerships::money) of every squad tab this client OWNS, keyed by tab
-    // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
-    // periodic safety resend (the publishStats pacing). Kenshi's wallet is
-    // per-Platoon; nothing else about money is on the wire (shop_probe).
+    // AFTER publishOwned (protocol 22b, both clients): publish the DELTA of our
+    // local change to the SHARED player-faction wallet (the real UI/shop wallet,
+    // engine::readPlayerWallet) on the reliable channel. Delta-based so two
+    // concurrent spenders sum correctly; no safety resend (reliable+ordered
+    // delivery applies each delta exactly once). Silent when the wallet is idle.
     void publishMoney(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 22): drain received wallet snapshots and write
-    // each PEER-owned tab's money onto our local copy of that tab's platoon
-    // via Ownerships::setMoney. Never writes a rank we own.
+    // BEFORE engine (protocol 22b): drain received wallet deltas and ADD each to
+    // our local copy of the shared faction wallet (engine::writePlayerWallet),
+    // advancing the baseline so the delta is not re-detected as a local change.
     void applyMoney(const SyncContext& ctx);
 
     // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
@@ -467,7 +475,7 @@ public:
     void setResearchSync(bool v) { researchSync_ = v; }
 
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
-    // buildings, placed-building doors, production, research) from one
+    // buildings, placed-building doors, production, research, bounty) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
     // used to inline: the table owns each channel's master enable, direction
     // (symmetric vs host-authoritative), and cadence ORDER (which must match the
@@ -476,6 +484,27 @@ public:
     // liveness. Money/recruit/squad/stealth/speed/time stay explicit (different
     // cadence positions / patterns).
     void driveSampledChannels(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, HOST only - the witness authority settled by
+    // the H2 live run): enumerate every durable bounty row on the bodies this
+    // engine carries (its driven copies of remote PCs, where a join-owned PC's
+    // bounty lives, PLUS host-owned PCs), diff each (char hand, faction sid)
+    // row's {amount, crimes, claimed} against a silently-seeded shared-save
+    // baseline, and stream change-gated PKT_BOUNTY rows (per-sid safety resend).
+    // The join NEVER calls this (host-authoritative, unidirectional host->clients).
+    // Driven from the kCh[] registry (hostAuth row), like publishResearch.
+    void publishBounties(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, client side): drain received bounty rows;
+    // each one that resolves to a local character + faction is applied onto the
+    // owning client's (clean) copy through the engine's own levers
+    // (unfairAddToBounty raise / clearBounty drop). The baseline updates BEFORE
+    // the write (echo-free); stale rows (per-key seq guard) and already-converged
+    // rows are skipped; unresolvable hands skip silently (out of interest).
+    void applyBounties(const SyncContext& ctx);
+
+    // Bounty/crime sync master enable (KENSHICOOP_BOUNTY_SYNC).
+    void setBountySync(bool v) { bountySync_ = v; }
 
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
@@ -746,6 +775,15 @@ private:
         // self-heal; this guard re-asserts setChainedMode independently so a peer
         // PC's local lockpick can't leave the owner's prisoner unlocked on the peer.
         unsigned long chainHealTick;
+        // Spike 58 (kind-conflict anchor): the furniture kind last vouched for
+        // this body by a RELIABLE edge (RECV ENTER, or the host's own
+        // PEER-ENTER authoring; 0 = none, cleared on a reliable EXIT / the
+        // debounced HEAL EXIT). While the lossy stream says chained
+        // (streamKind=3) but an edge vouches the local cage/bed (1/2), the
+        // cage/bed stays the transform anchor and the shackle is re-asserted
+        // EQUIP-only (chainAnchorStep) - the kind=3 heal must not break an
+        // edge-vouched cage every FURN_HEAL_MS (the 75-885 u re-seat teleport).
+        int           furnEdgeKind;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
@@ -785,7 +823,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   haveChainOwner(false), chainHealTick(0),
+                   haveChainOwner(false), chainHealTick(0), furnEdgeKind(0),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
@@ -814,6 +852,11 @@ private:
     void logDriveTelemetry(unsigned long now);
     //   * age out long-stale targets_ entries (reliable-event latches preserved).
     void ageOutStaleTargets(unsigned long now);
+    //   * owner-side carried self-heal (SYNC_GAPS 16b): unlike the phases above
+    //     this one also reads LOCAL carry state, so it takes gw + the captured
+    //     squad rather than only Replicator members + the tick clock.
+    void healOwnCarried(GameWorld* gw, const EntityState* oracleSquad,
+                        unsigned int oracleSquadN, unsigned long now);
 
     std::map<Key, Driven> targets_;
     // Host side: last bodyState we published per owned entity (+ when it was last
@@ -970,6 +1013,12 @@ private:
     // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
     // just freed - the exit-vs-reauthor race guard.
     std::map<Key, unsigned long> ownFurnExit_;
+    // Owner-side carried self-heal (SYNC_GAPS 16b): per-own-hand debounce
+    // anchor - first tick an OWNED body's local isBeingCarried had NO live
+    // streamed TASK_CARRY_BODY claim backing it (0 = disarmed). Stepped by
+    // coop::carriedHealStep in applyTargets; entries erased once the body is
+    // no longer carried, so the map stays squad-sized.
+    std::map<Key, unsigned long> ownCarriedNoSee_;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
     float                 snapDist_;  // moving-body hard-snap distance floor (u)
@@ -1310,13 +1359,11 @@ private:
     // RESEND_MS names to these fields, so behavior is unchanged - this is the one
     // place their cadence now lives. See SyncTuning.h.
     SyncTuning tuning_;
-    // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
-    // (change gate + safety resend). A settled economy is silent.
-    struct MoneyPub {
-        int lastSent; unsigned long lastSendMs;
-        MoneyPub() : lastSent(-1), lastSendMs(0) {}
-    };
-    std::map<unsigned int, MoneyPub> moneyPub_;
+    // Protocol 22b: the SHARED player-faction wallet reconciled by delta (see
+    // MoneyReconcile.h). One baseline for the whole session - the wallet is
+    // per-faction, not per-tab. seeded on the first sample, advanced on every
+    // local delta published and every remote delta applied.
+    MoneyState factionMoney_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
@@ -1437,6 +1484,30 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Protocol 45 bounty/crime rows, keyed by (owning-character hand, faction
+    // sid) - BountyManager is inline per-Character, so the key is per-character,
+    // NOT per-squad. HOST (the only publisher): known = the shared-save baseline
+    // (seeded silently on first sight, updated on every row we send - so a
+    // resend is not re-detected); lastSendMs = change gate + safety resend.
+    // CLIENT: seqSeen = stale-row guard (the client never publishes, so the send
+    // fields stay idle). The value triple mirrors the wire row.
+    struct BountyRow {
+        int knownAmount; u32 knownCrimes; int knownClaimed;
+        unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        BountyRow() : knownAmount(0), knownCrimes(0), knownClaimed(0),
+                      lastSendMs(0), seqSeen(0), seeded(false) {}
+    };
+    std::map<std::pair<Key, std::string>, BountyRow> bountyRows_;
+    u32           bountySeqOut_;
+    unsigned long bountySampleMs_;
+    bool          bountySync_;
+    // False until the first publishBounties sample has seeded every load-time
+    // bounty row as the shared-save baseline. After that, a newly-seen (char,
+    // faction) key is a genuine mid-session appearance (a fresh crime), streamed
+    // from an implicit zero instead of silently re-seeded (a bounty ROW can go
+    // from not-existing to existing, unlike the always-present faction/door rows).
+    bool          bountyBaseline_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

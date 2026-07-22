@@ -31,6 +31,7 @@
 #include "core/Config.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/StatusAutohide.h" // persistent status-banner auto-hide policy
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
@@ -785,7 +786,30 @@ void coopPanelDrive(GameWorld* gw) {
     coop::steaminvite::tick();
 
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect, &coopUiSync);
-    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+    // Auto-hide the persistent status banner once it has sat in the connected
+    // ("green", ostate == 2) state for a sustained window, so a stable session stops
+    // showing "Connected - peer joined" forever. Leaving green (peer disconnects,
+    // session drops, or a reconnect cycles back through the waiting state) reappears
+    // the banner instantly and re-arms the timer when green settles again. The
+    // decision lives in the pure, unit-tested StatusAutohide.h; here we just own the
+    // clock + the green-streak start tick. KENSHICOOP_STATUS_AUTOHIDE_MS overrides the
+    // 10 s default; 0 disables it (banner stays up = the pre-autohide behavior).
+    static int          s_autohideMs = -1;    // ms; -1 = unread, 0 = disabled
+    static unsigned long s_greenSince = 0;    // tick the green state began (0 = not green)
+    if (s_autohideMs < 0) {                   // read the env override once (matches autoRecruit)
+        const char* e = std::getenv("KENSHICOOP_STATUS_AUTOHIDE_MS");
+        s_autohideMs = e ? std::atoi(e) : (int)coop::STATUS_AUTOHIDE_MS;
+        if (s_autohideMs < 0) s_autohideMs = 0; // clamp junk negatives to "disabled"
+    }
+    unsigned long nowMs = GetTickCount();
+    if (ostate == 2) {                        // connected/green
+        if (s_greenSince == 0) s_greenSince = nowMs; // arm on the rising edge into green
+    } else {
+        s_greenSince = 0;                     // left green: disarm so the banner reappears
+    }
+    bool showBanner = coop::statusOverlayShown(g_net.isRunning(), s_greenSince,
+                                               nowMs, (unsigned long)s_autohideMs);
+    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, showBanner);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -1038,6 +1062,16 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
     }
     if (worldLive) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Auto-revert (W1 non-gear pickup dupe mitigation): a NON-gear ground proxy is
+        // a real, pickable object; if a local character grabbed a peer's proxy, retaining
+        // it duplicates the authoring client's still-held real item (which mirrors back
+        // over the inventory channel below). Re-drop any picked-up proxy to the ground
+        // BEFORE publishInventories, so the pickup never becomes a published/persisted
+        // second copy. Gated on worldSync (proxies only exist when it is on). NOT pickup
+        // conservation (Phase W4) - the peer still cannot TAKE non-gear drops; the dupe
+        // is simply closed while the drop stays visible.
+        if (g_cfg.worldSync)
+            g_repl.revertProxyPickups(gw);
         // Both clients stream the contents of every squad member they OWN (host tab 0,
         // join tab 1) on content-change - bidirectional, disjoint by the same tab
         // partition as positional sync. Gated on invSync so ordinary co-op sessions add
@@ -1088,10 +1122,11 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishStats(gw, g_net, g_net.localId());
             g_repl.applyStats(gw, g_inbound);
         }
-        // Per-tab wallet sync (protocol 22): each client streams the money of
-        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
-        // received snapshots land on the peer tabs via Ownerships::setMoney.
-        // Ordered after publishOwned (ownership ranks are the partition rule).
+        // Shared-wallet sync (protocol 22b): the player's real money is ONE
+        // per-faction wallet (Faction::factionOwnerships) shared by both co-op
+        // players, so each client publishes the DELTA of its own local change
+        // and the peer ADDS it - concurrent spends sum correctly. Reliable +
+        // ordered, so each delta applies exactly once (no safety resend).
         if (g_cfg.moneySync) {
             g_repl.publishMoney(replCtx(gw));
             g_repl.applyMoney(replCtx(gw));
@@ -1142,6 +1177,10 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
         // free to leave in the tick for manual-session characterization.
         coop::engine::shackleDbgTick(gw, g_cfg.isHost);
+        // Spike 59: env-gated ([bounty]) bounty/crime observer - direct reads
+        // of the Character+0xF0 inline BountyManager (sentinel-verified). No-op
+        // unless KENSHICOOP_BOUNTY_PROBE=1, so it is free to leave in the tick.
+        coop::engine::bountyProbeTick(gw, g_cfg.isHost);
         // Game-clock sync (protocol 25): the host broadcasts its absolute
         // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
         // multiplier the speed layer's quiet writes fold in on top of the
@@ -1419,6 +1458,40 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                 "[recruit] AUTORECRUIT res=%d before=%u,%u,%u,%u,%u "
                 "after=%u,%u,%u,%u,%u", res, hb[0], hb[1], hb[2], hb[3], hb[4],
                 ha[0], ha[1], ha[2], ha[3], ha[4]);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
+    // Manual-validation helper (host only): KENSHICOOP_AUTOCRIME=N seconds -
+    // ONCE, N s after gameplay settles, programmatically assign a test bounty to
+    // a player-squad character (index = KENSHICOOP_AUTOCRIME_INDEX, default 1) via
+    // the engine's own unfairAddToBounty lever. On the host in inhabit mode a
+    // non-zero index is a JOIN-owned character's driven copy, so this reproduces
+    // the exact H2 witness-local state (a bounty on the host's copy of a join-owned
+    // PC) the protocol-45 channel must then carry to the owner - deterministic
+    // evidence without a hand-driven witnessed crime. OFF by default (0 = no-op).
+    if (g_cfg.isHost && g_gameStarted) {
+        static int  autoCrimeS    = -1;
+        static int  autoCrimeIdx  = -1;
+        static bool autoCrimeDone = false;
+        if (autoCrimeS < 0) {
+            const char* e = std::getenv("KENSHICOOP_AUTOCRIME");
+            autoCrimeS = e ? std::atoi(e) : 0;
+            const char* ei = std::getenv("KENSHICOOP_AUTOCRIME_INDEX");
+            autoCrimeIdx = ei ? std::atoi(ei) : 1;
+            if (autoCrimeIdx < 0) autoCrimeIdx = 1;
+        }
+        if (autoCrimeS > 0 && !autoCrimeDone &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)autoCrimeS * 1000u) {
+            autoCrimeDone = true;
+            unsigned int hand[5]; char sid[64];
+            bool ok = coop::engine::injectTestBounty(gw, (unsigned)autoCrimeIdx,
+                                                     500, hand, sid, sizeof(sid));
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                "[bounty] AUTOCRIME ok=%d idx=%d hand=%u,%u,%u,%u,%u fac='%s' amount=500",
+                ok ? 1 : 0, autoCrimeIdx, hand[0], hand[1], hand[2], hand[3], hand[4],
+                sid[0] ? sid : "-");
             b[sizeof(b) - 1] = '\0'; coopLog(b);
         }
     }
@@ -2010,6 +2083,7 @@ void installEngineDetours() {
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
     g_repl.setResearchSync(g_cfg.researchSync);
+    g_repl.setBountySync(g_cfg.bountySync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never

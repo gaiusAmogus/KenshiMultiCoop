@@ -558,39 +558,23 @@ unsigned int Replicator::tabRepresentatives(GameWorld* gw, unsigned int rankHand
 void Replicator::publishMoney(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!moneySync_) return;
-    const unsigned long RESEND_MS   = tuning_.moneyResendMs;  // safety resend (a lost write self-heals)
-    const unsigned long MIN_SEND_MS = tuning_.moneyMinSendMs; // wallets move in bursts; ~1 Hz is plenty
-    const unsigned int  MAX_RANKS   = 8;
-    unsigned long now = nowMs();
-    unsigned int rankHand[MAX_RANKS][5];
-    unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
-    for (unsigned int r = 0; r < nRanks; ++r) {
-        // Own-tabs only (the same partition rule as publishOwned's entity filter).
-        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (!owned || rankHand[r][0] == 0xFFFFFFFFu) continue;
-        int money = -1;
-        if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
-        MoneyPub& mp = moneyPub_[r];
-        bool changed = (money != mp.lastSent);
-        // Money has no silent seed step, so a never-sent row is resend-due: a
-        // fresh wallet still streams once. (resendUnsent = true.)
-        if (!sync::gateShouldSend(changed, now, mp.lastSendMs, MIN_SEND_MS,
-                                  RESEND_MS, /*resendUnsent*/ true))
-            continue;
-        mp.lastSent = money; mp.lastSendMs = now;
-        MoneyPacket pkt;
-        memset(&pkt, 0, sizeof(pkt));
-        pkt.type    = (u8)PKT_MONEY;
-        pkt.ownerId = ownerId;
-        pkt.tabRank = r;
-        pkt.money   = money;
-        net.queueMoney(pkt);
-        if (changed) { // resends stay silent; the change is the signal
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "[money] SEND rank=%u cats=%d", r, money);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-    }
+        // The SHARED player-faction wallet (the real UI/shop wallet). Read it, detect
+    // our local delta vs the baseline, and publish only that delta. Both clients
+    // run this; each replicates its own spends/earnings onto the one shared pool.
+    int cur = -1;
+    if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
+    int delta = 0;
+    if (!coop::moneyLocalDelta(factionMoney_, cur, &delta)) return; // seed or idle
+    MoneyPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type    = (u8)PKT_MONEY;
+    pkt.ownerId = ownerId;
+    pkt.tabRank = 0;      // unused - the wallet is per-faction, not per-tab
+    pkt.money   = delta;  // signed delta to apply on the peer
+    net.queueMoney(pkt);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[money] SEND delta=%d cats=%d", delta, cur);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
 void Replicator::applyMoney(const SyncContext& ctx) {
@@ -599,28 +583,21 @@ void Replicator::applyMoney(const SyncContext& ctx) {
     in.drainMoney(got);
     if (got.empty()) return;
     if (!moneySync_) return;
-    const unsigned int MAX_RANKS = 8;
-    unsigned int rankHand[MAX_RANKS][5];
-    unsigned int nRanks = 0;
-    bool haveRanks = false;
+    // Apply each received delta to the shared faction wallet, advancing the
+    // baseline so our next publishMoney does not echo it back. Reliable+ordered
+    // delivery means every delta lands exactly once - no idempotence key needed.
     for (std::deque<InboundMoney>::iterator it = got.begin(); it != got.end(); ++it) {
-        const MoneyPacket& p = it->pkt;
-        unsigned int r = p.tabRank;
-        // Never write a tab we own - our engine is that wallet's authority.
-        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (owned || p.money < 0) continue;
-        if (!haveRanks) { // one census per drain (cheap; usually 1 packet anyway)
-            nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
-            haveRanks = true;
-        }
-        if (r >= nRanks || rankHand[r][0] == 0xFFFFFFFFu) continue;
+        int delta = it->pkt.money;
+        if (delta == 0) continue;
         int cur = -1;
-        engine::readWalletByHand(rankHand[r], &cur);
-        if (cur == p.money) continue; // already converged (resend or echo)
-        bool ok = engine::writeWalletByHand(rankHand[r], p.money);
+        if (!engine::readPlayerWallet(gw, &cur) || cur < 0) continue;
+        // moneyApplyDelta clamps the wallet to >=0 AND keeps the baseline in
+        // sync with the clamped value (no spurious phantom delta next publish).
+        int want = coop::moneyApplyDelta(factionMoney_, cur, delta);
+        bool ok = engine::writePlayerWallet(gw, want);
         char b[112];
-        _snprintf(b, sizeof(b) - 1, "[money] RECV rank=%u cats=%d was=%d ok=%d",
-                  r, p.money, cur, ok ? 1 : 0);
+        _snprintf(b, sizeof(b) - 1, "[money] RECV delta=%d was=%d now=%d ok=%d",
+                  delta, cur, want, ok ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1063,6 +1040,154 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!bountySync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // crimes resolve over seconds; 1 Hz is plenty
+    const unsigned long RESEND_MS = 15000; // safety resend for rows we ever sent
+    unsigned long now = nowMs();
+    if (bountySampleMs_ != 0 && (now - bountySampleMs_) < SAMPLE_MS) return;
+    bountySampleMs_ = now;
+
+    // Snapshot every durable bounty row this engine carries (host-side driven
+    // copies of remote PCs + host-owned PCs - the H2 subject set).
+    const unsigned int MAX_ROWS = 128;
+    static engine::BountyPubRow rows[MAX_ROWS]; // main-thread only
+    unsigned int n = engine::enumBountyRows(gw, rows, MAX_ROWS);
+
+    // Track which (char, faction) keys are live this sample so a row that
+    // VANISHED (host paid off / served the sentence -> clearBounty removed the
+    // map entry, so it no longer enumerates) can stream a one-shot clear.
+    std::set<std::pair<Key, std::string> > seen;
+
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::BountyPubRow& r = rows[i];
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        std::pair<Key, std::string> key(k, std::string(r.sid));
+        seen.insert(key);
+        BountyRow& br = bountyRows_[key];
+        BountyVal known; known.amount = br.knownAmount;
+        known.crimes = br.knownCrimes; known.claimed = br.knownClaimed;
+        BountyVal cur; cur.amount = r.amount; cur.crimes = r.crimes; cur.claimed = r.claimed;
+        if (!br.seeded) {
+            br.seeded = true;
+            if (!bountyBaseline_) {
+                // FIRST channel sample: a bounty already present at (or near) load
+                // is the SHARED baseline (both clients loaded the same save), so
+                // seed it silently and stream only later movement.
+                br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+                continue;
+            }
+            // The baseline pass already ran, so this key APPEARED mid-session -
+            // a crime just created a bounty row where there was none (0 rows -> 1).
+            // That is exactly the movement H2 must carry, NOT a load-time seed:
+            // treat the implicit baseline as zero and fall through to the send
+            // path. (A row that instead existed at load but only now entered
+            // interest range still converges harmlessly - the receiver's apply is
+            // convergence-first against getActualBounty.)
+            br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+            known.amount = 0; known.crimes = 0; known.claimed = 0;
+        }
+        int resendDue = (br.lastSendMs != 0 && (now - br.lastSendMs) >= RESEND_MS) ? 1 : 0;
+        // Host-authoritative publish gate (the exact rule prototest locks): the
+        // host streams a seeded row that moved or is due a resend; a join never
+        // reaches here (Plugin.cpp calls this on the host only).
+        if (!bountyShouldSend(/*isHost*/1, /*seeded*/1, &known, &cur, resendDue)) continue;
+        bool changed = (known.amount != cur.amount) || (known.crimes != cur.crimes) ||
+                       (known.claimed != cur.claimed);
+        br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+        br.lastSendMs = now;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount  = r.amount;
+        pkt.crimes  = r.crimes;
+        pkt.claimed = (u8)(r.claimed ? 1 : 0);
+        net.queueBounty(pkt);
+        if (changed) { // resends stay silent; the movement is the signal
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                      "[bounty] SEND hand=%u,%u fac='%s' amount=%d crimes=0x%X claimed=%d seq=%u",
+                      r.hand[3], r.hand[4], r.sid, r.amount, r.crimes, r.claimed, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Disappearance -> clear: a previously-positive seeded row absent from this
+    // sample means the host CLEARED it (paid off / sentence served). Stream one
+    // amount=0 row so the client drops its copy, and reset the baseline to 0 (NOT
+    // erase - if the subject merely went out of interest range and re-appears
+    // still-wanted, the next sample re-detects 0->amount and re-streams it).
+    for (std::map<std::pair<Key, std::string>, BountyRow>::iterator it = bountyRows_.begin();
+         it != bountyRows_.end(); ++it) {
+        BountyRow& br = it->second;
+        if (!br.seeded || br.knownAmount == 0) continue;
+        if (seen.find(it->first) != seen.end()) continue; // still live this sample
+        br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+        br.lastSendMs = now;
+        const Key& k = it->first.first;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        pkt.hand[0] = k.t; pkt.hand[1] = k.c; pkt.hand[2] = k.cs;
+        pkt.hand[3] = k.i; pkt.hand[4] = k.s;
+        strncpy(pkt.sid, it->first.second.c_str(), sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount = 0; pkt.crimes = 0; pkt.claimed = 0;
+        net.queueBounty(pkt);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] SEND-CLEAR hand=%u,%u fac='%s' seq=%u",
+                  k.i, k.s, it->first.second.c_str(), pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The first sample has now captured every load-time bounty row as the shared
+    // baseline. From here on, a newly-seen (char, faction) key is a genuine
+    // mid-session appearance (a fresh crime), streamed from an implicit zero.
+    bountyBaseline_ = true;
+}
+
+void Replicator::applyBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundBounty> got;
+    in.drainBounty(got);
+    if (got.empty()) return;
+    if (!bountySync_) return;
+    for (std::deque<InboundBounty>::iterator it = got.begin(); it != got.end(); ++it) {
+        const BountyPacket& p = it->pkt;
+        if (p.sid[0] == '\0') continue;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        std::pair<Key, std::string> key(k, std::string(p.sid));
+        BountyRow& br = bountyRows_[key];
+        if (br.seqSeen != 0 && p.seq <= br.seqSeen) continue; // stale row (bountyApplyDecision SKIP_STALE)
+        br.seqSeen = p.seq;
+        // Echo guard: update the baseline BEFORE the write so the mutation this
+        // apply causes is never re-detected as local movement (the client does
+        // not publish, but the guard keeps the row's known state coherent).
+        br.knownAmount = p.amount; br.knownCrimes = p.crimes;
+        br.knownClaimed = p.claimed ? 1 : 0; br.seeded = true;
+        int before = -1, after = -1;
+        bool ok = engine::applyBountyRow(gw, p.hand, p.sid, p.amount, p.crimes,
+                                         p.claimed ? 1 : 0, &before, &after);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] RECV hand=%u,%u fac='%s' amount=%d was=%d now=%d crimes=0x%X ok=%d seq=%u",
+                  p.hand[3], p.hand[4], p.sid, p.amount, before, after,
+                  p.crimes, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1303,7 +1428,11 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        // Bounty/crime (protocol 45): host-authoritative, unidirectional
+        // host->clients (the join NEVER publishes its bounty state) - so hostAuth
+        // = true, exactly like prod/research. After research, as the old tick had.
+        { &Replicator::bountySync_,   0,                     &Replicator::publishBounties,   &Replicator::applyBounties,   true  }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
@@ -1381,9 +1510,10 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     for (std::map<Key, StatsPub>::iterator it = statsPub_.begin();
          it != statsPub_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nStats; }
-    for (std::map<unsigned int, MoneyPub>::iterator it = moneyPub_.begin();
-         it != moneyPub_.end(); ++it)
-        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nMoney; }
+       // Money (protocol 22b) is delta-reconciled on a reliable+ordered channel, so
+    // there is no per-row safety-resend cache to age here: a late joiner loads
+    // the same coordinated save (identical starting wallet) and both sides then
+    // apply each other's deltas as they happen. nMoney stays 0 by design.
     for (std::map<Key, InvPub>::iterator it = invPub_.begin();
          it != invPub_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nInv; }

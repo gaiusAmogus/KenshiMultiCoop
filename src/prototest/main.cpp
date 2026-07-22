@@ -34,6 +34,11 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/sync/DriveTaper.h"    // walk-drive deceleration taper (pure inline)
+#include "../plugin/core/CarriedHeal.h"  // owner-side carried self-heal (16b)
+#include "../plugin/core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
+#include "../plugin/core/StatusAutohide.h" // status-banner auto-hide policy (pure inline)
+#include "../plugin/core/MoneyReconcile.h" // Phase 6/22b: shared-wallet delta reconcile
 #include "../plugin/sync/SaveXfer.h"     // Part A: real save-transfer receiver end-to-end
 
 #include <set>
@@ -115,6 +120,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
+    CHECK_EQ("sizeof(BountyPacket)",            sizeof(BountyPacket),            86); // v45: bounty/crime row
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -220,7 +226,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v46: character name + animal age sync)", (int)PROTOCOL_VERSION, 46);
+    CHECK_EQ("PROTOCOL_VERSION (v45: bounty/crime / PKT_BOUNTY; v44 was bulk channel + session epoch)", (int)PROTOCOL_VERSION, 46);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -1404,6 +1410,46 @@ static void testObjectHandLayout() {
     d = h; d.serial++;          CHECK("equals detects serial diff",    !d.equals(h));
 }
 
+// ---- 13. Persistent status-banner auto-hide (StatusAutohide.h) ------------------
+// Guards the QoL auto-hide (2026-07-20): the green "Connected - peer joined" banner
+// floats over the leader for the whole session. Once the session has held the
+// connected/green state for a sustained window it auto-hides so it stops cluttering
+// the screen; leaving green (disconnect / peer leave / reconnect) reappears it
+// immediately and re-arms the timer. Same unsigned-wrap-safe shape as poseClearElapsed.
+static void testStatusAutohide() {
+    std::printf("== status banner auto-hide (StatusAutohide.h) ==\n");
+    const unsigned long ms = STATUS_AUTOHIDE_MS; // 10000 (default)
+
+    // Not green (stableSince == 0): never auto-hidden, banner keeps showing.
+    CHECK("not green never auto-hides",  !statusAutohideElapsed(0, 999999, ms));
+
+    // Green but still inside the window: banner holds (no premature hide).
+    CHECK("green 0 ms holds",            !statusAutohideElapsed(5000, 5000,  ms));
+    CHECK("green 9999 ms holds",         !statusAutohideElapsed(5000, 14999, ms));
+
+    // Green at/after the window: banner auto-hides.
+    CHECK("green 10000 ms hides",         statusAutohideElapsed(5000, 15000, ms));
+    CHECK("green 30 s hides",             statusAutohideElapsed(5000, 35000, ms));
+
+    // autohideMs == 0 disables the feature (banner never auto-hides).
+    CHECK("disabled never hides",        !statusAutohideElapsed(5000, 999999, 0));
+
+    // Unsigned GetTickCount wrap across the window still elapses correctly: the green
+    // streak started 100 ms before the 2^32 rollover; 'now' is written post-wrapped.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // green began 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, pre-wrap (holds)
+    const unsigned long postWrap = 9899UL;             // (nearMax + 10000) mod 2^32 = 10000 ms later
+    CHECK("wrap: 50 ms holds",           !statusAutohideElapsed(nearMax, preWrap,  ms));
+    CHECK("wrap: 10 s hides",             statusAutohideElapsed(nearMax, postWrap, ms));
+
+    // statusOverlayShown combiner: running gate + auto-hide decision together.
+    CHECK("offline never shows",         !statusOverlayShown(false, 0,    100,   ms));
+    CHECK("green fresh shows",            statusOverlayShown(true,  5000, 5000,  ms));
+    CHECK("green stale hides",           !statusOverlayShown(true,  5000, 20000, ms));
+    CHECK("running non-green shows",      statusOverlayShown(true,  0,    99999, ms)); // waiting
+    CHECK("disabled stays shown",         statusOverlayShown(true,  5000, 99999, 0));
+}
+
 // ---- Engine fault throttle contract (Phase 5c) ------------------------------
 // Locks the pure throttle decision that gates the "[engine] FAULT" oracle line:
 // always emit the first hit, then at most once per interval, tolerating the
@@ -1556,6 +1602,299 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 13. Bounty/crime authority + convergence (Wire.h pure decision logic) ------
+// Locks the protocol-45 H2 witness-local rules WITHOUT a live engine (the engine
+// read/write shims stay behind SEH in EngineCharState.cpp): the HOST is the sole
+// publisher (a join must NEVER push its own bounty state upstream), and the
+// receiver drops stale rows, skips converged rows, and picks the raise/clear
+// lever by the signed amount delta. These are the exact rules publishBounties /
+// applyBounties + applyBountyRow implement.
+static void testBounty() {
+    std::printf("== bounty/crime authority + convergence (Wire.h) ==\n");
+
+    // Value triples: a clean baseline vs a mid-session bounty.
+    BountyVal clean; clean.amount = 0;   clean.crimes = 0;      clean.claimed = 0;
+    BountyVal wanted; wanted.amount = 500; wanted.crimes = 0x20; wanted.claimed = 0;
+
+    // --- Publish gate: HOST authoritative (H2) ---
+    // Host, seeded, the row MOVED (0 -> 500): publish.
+    CHECK("host publishes a bounty that appeared",
+          bountyShouldSend(/*isHost*/1, /*seeded*/1, &clean, &wanted, /*resendDue*/0) == 1);
+    // Host, seeded, unchanged, no resend due: stay silent.
+    CHECK("host silent on an unchanged row",
+          bountyShouldSend(1, 1, &wanted, &wanted, 0) == 0);
+    // Host, seeded, unchanged, but a safety resend is due: publish.
+    CHECK("host resends an unchanged row when due",
+          bountyShouldSend(1, 1, &wanted, &wanted, 1) == 1);
+    // Host, NOT yet seeded (first sight of a shared-save bounty): silent seed.
+    CHECK("host seeds the shared-save baseline silently",
+          bountyShouldSend(1, 0, &clean, &wanted, 0) == 0);
+
+    // --- The discriminator: a JOIN never publishes (unidirectional host->clients) ---
+    // Even with a genuine local movement, a resend due, and a seeded row, a
+    // non-host caller must produce ZERO upstream traffic. This is the test that
+    // fails if the host-only authority is ever broken.
+    CHECK("join never publishes an appeared bounty",
+          bountyShouldSend(/*isHost*/0, 1, &clean, &wanted, 0) == 0);
+    CHECK("join never publishes even with a resend due",
+          bountyShouldSend(0, 1, &wanted, &wanted, 1) == 0);
+    // Join "revert" attempt: it received the host's 500, then its own engine
+    // reads its (forked, still-clean) copy as 0 and would try to stream that
+    // back. It must NOT - the host stays authoritative.
+    CHECK("join revert to local 0 is never sent upstream",
+          bountyShouldSend(0, 1, &wanted, &clean, 1) == 0);
+
+    // --- Receiver apply decision ---
+    int delta = -12345;
+    // Stale row: incoming seq <= the newest already applied -> drop, no write.
+    CHECK("apply drops a stale seq",
+          bountyApplyDecision(/*seqSeen*/7, /*incoming*/5, 500, 0, &delta) == BOUNTY_APPLY_SKIP_STALE);
+    // Fresh seq, local already at the target -> converged, no write (resend/echo).
+    CHECK("apply skips an already-converged row",
+          bountyApplyDecision(3, 9, 500, 500, &delta) == BOUNTY_APPLY_SKIP_CONVERGED);
+    // Fresh seq, raise 0 -> 500: additive lever, delta = +500.
+    delta = 0;
+    CHECK("apply raises with a positive delta",
+          bountyApplyDecision(3, 9, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply raise delta is target-current", delta == 500);
+    // Fresh seq, raise 200 -> 500: delta = +300 (additive keeps engine derived state).
+    delta = 0;
+    CHECK("apply partial raise delta",
+          bountyApplyDecision(3, 9, 500, 200, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply partial raise delta value", delta == 300);
+    // Fresh seq, target 0 with a live local bounty: clearBounty, not a delta.
+    delta = 999;
+    CHECK("apply clears when target is zero",
+          bountyApplyDecision(3, 9, 0, 500, &delta) == BOUNTY_APPLY_CLEAR);
+    // seqSeen == 0 (first ever row) must NOT be treated as stale.
+    CHECK("apply accepts the first row (seqSeen 0)",
+          bountyApplyDecision(0, 1, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+
+    // --- Tag / identity ---
+    CHECK("PKT_BOUNTY tag is 42",             PKT_BOUNTY == 42);
+    CHECK("PKT_BOUNTY distinct from CAM_HINT", PKT_BOUNTY != PKT_CAM_HINT);
+}
+
+// Walk-drive deceleration taper (on-stop overshoot/snap-back fix). The taper is
+// the load-bearing pure fraction the drive multiplies lead/catch-up/cap by as the
+// source decelerates; locking its clamp + monotonicity here proves the "converge
+// to the stop, don't overrun" contract without a game launch.
+static void testDriveTaper() {
+    std::printf("\n== walk-drive deceleration taper ==\n");
+    using coop::driveSpeedTaper;
+
+    const float REF = 6.0f; // CATCHUP_REF_SPEED
+
+    // Full strength at/above the reference cruise speed (clamped high).
+    CHECK("at cruise = 1",       driveSpeedTaper(6.0f, REF) == 1.0f);
+    CHECK("above cruise = 1",    driveSpeedTaper(50.0f, REF) == 1.0f);
+    // Zero at a full stop (the whole point: no lead/catch-up push past the mark).
+    CHECK("at stop = 0",         driveSpeedTaper(0.0f, REF) == 0.0f);
+    // Linear in between: half the reference speed -> half strength.
+    CHECK("half speed = 0.5",    driveSpeedTaper(3.0f, REF) == 0.5f);
+    // Negative velocity noise clamps to 0 (never a negative cap/lead).
+    CHECK("negative clamps to 0", driveSpeedTaper(-2.0f, REF) == 0.0f);
+    // Monotonic non-decreasing as speed rises (a faster source never tapers more).
+    CHECK("monotonic 1<2u",      driveSpeedTaper(1.0f, REF) < driveSpeedTaper(2.0f, REF));
+    CHECK("monotonic 2<5u",      driveSpeedTaper(2.0f, REF) < driveSpeedTaper(5.0f, REF));
+    // Defensive: a non-positive reference disables the taper (full strength) so a
+    // mis-tuned constant can never freeze the drive at 0.
+    CHECK("zero ref = full",     driveSpeedTaper(3.0f, 0.0f) == 1.0f);
+    CHECK("neg ref = full",      driveSpeedTaper(3.0f, -1.0f) == 1.0f);
+
+    // The cap formula the drive uses: base * (1 + 1.5*frac) spans 1x (stop) to
+    // 2.5x (cruise) - guard the endpoints so the "2.5x cruise -> 1x stop" intent
+    // can't silently drift if the taper shape ever changes.
+    CHECK("cap 1x at stop",   (1.0f + 1.5f * driveSpeedTaper(0.0f, REF)) == 1.0f);
+    CHECK("cap 2.5x cruise",  (1.0f + 1.5f * driveSpeedTaper(6.0f, REF)) == 2.5f);
+}
+
+// ---- 12. Owner-side carried self-heal debounce (CarriedHeal.h) ------------------
+// Guards the SYNC_GAPS 16b fix: the owner of a carried body reconciles its LOCAL
+// isBeingCarried against the carrier's streamed TASK_CARRY_BODY claim. The step
+// must (a) stay quiet while a live stream claims the carry, (b) arm-then-fire only
+// after a full debounce window with NO claim (a one-batch stream blip must never
+// rip a genuine carry apart - the carryNoSeeTick lesson), and (c) re-arm after
+// firing so a release that failed to take retries a full window later.
+
+static void testCarriedHeal() {
+    std::printf("== owner-side carried heal debounce (CarriedHeal.h) ==\n");
+    const unsigned long DROP = 3000;
+    unsigned long tick = 0;
+
+    // Not carried: nothing to do, anchor stays disarmed.
+    tick = 0;
+    CHECK("not carried -> NONE",
+          carriedHealStep(false, false, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("not carried -> anchor disarmed", tick == 0);
+
+    // Carried + claimed by a live stream: believed, anchor stays disarmed.
+    tick = 0;
+    CHECK("carried+claimed -> NONE",
+          carriedHealStep(true, true, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("carried+claimed -> anchor disarmed", tick == 0);
+
+    // First unclaimed tick arms the window but must NOT act yet.
+    tick = 0;
+    CHECK("first unclaimed -> ARM",
+          carriedHealStep(true, false, 1000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("ARM stamps the anchor", tick == 1000);
+
+    // Inside the window: still quiet (a stream blip shorter than the window).
+    CHECK("inside window -> NONE",
+          carriedHealStep(true, false, 1000 + DROP, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("window boundary is exclusive (== dropMs does not fire)", tick == 1000);
+
+    // A claim arriving mid-window disarms it - no release ever happens.
+    CHECK("claim mid-window -> NONE + disarm",
+          carriedHealStep(true, true, 2500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+
+    // Full window with no claim: fire, and re-arm (anchor back to 0).
+    tick = 0;
+    carriedHealStep(true, false, 1000, DROP, &tick);           // arm at t=1000
+    CHECK("window elapsed -> FIRE",
+          carriedHealStep(true, false, 1000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+    CHECK("FIRE re-arms (anchor cleared)", tick == 0);
+
+    // Still stuck after a failed release: the NEXT pass arms again, then fires
+    // again a full window later (throttled retry, never a per-tick drop spam).
+    CHECK("post-FIRE re-arms on next pass",
+          carriedHealStep(true, false, 5000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("post-FIRE retry fires a full window later",
+          carriedHealStep(true, false, 5000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+
+    // Body put down locally (drop finally applied): disarmed, back to quiet.
+    carriedHealStep(true, false, 12000, DROP, &tick);          // re-armed
+    CHECK("local drop applied -> NONE + disarm",
+          carriedHealStep(false, false, 12500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+}
+
+// ---- 12. Captive kind-conflict anchor (JailAnchor.h) ---------------------------
+// Guards the spike-58 fix: a chained+caged prisoner streams CHAINED-only in the
+// lossy batch while the reliable edges vouch the cage. The step must (a) HOLD an
+// edge-vouched cage/bed (no break, no re-chain transform - the 75-885 u re-seat
+// teleport), (b) still RECHAIN a stale/unvouched local attach (the Flashbox
+// case), and (c) stay quiet when the stream is not chained or the copy already
+// is (no invented heals).
+
+static void testJailAnchor() {
+    std::printf("== captive kind-conflict anchor (JailAnchor.h) ==\n");
+
+    // Not a chained stream: never this policy's business (kind 1/2 heals and
+    // the no-furniture drive handle those).
+    CHECK("cage stream -> NONE",    chainAnchorStep(2, 2, 2) == CHAIN_ANCHOR_NONE);
+    CHECK("bed stream -> NONE",     chainAnchorStep(1, 1, 1) == CHAIN_ANCHOR_NONE);
+    CHECK("no stream kind -> NONE", chainAnchorStep(0, 2, 2) == CHAIN_ANCHOR_NONE);
+
+    // Already chained locally: in sync, nothing to heal.
+    CHECK("chained+chained -> NONE",        chainAnchorStep(3, 3, 0) == CHAIN_ANCHOR_NONE);
+    CHECK("chained+chained vouched -> NONE", chainAnchorStep(3, 3, 3) == CHAIN_ANCHOR_NONE);
+
+    // The bug: CHAINED-only continuous bit against an edge-vouched cage/bed.
+    // The anchor wins - never break it over the disagreement.
+    CHECK("vouched cage vs chained -> HOLD", chainAnchorStep(3, 2, 2) == CHAIN_ANCHOR_HOLD);
+    CHECK("vouched bed vs chained -> HOLD",  chainAnchorStep(3, 1, 1) == CHAIN_ANCHOR_HOLD);
+
+    // An UNVOUCHED local cage is the Flashbox stale attach: break + re-chain.
+    CHECK("unvouched cage -> RECHAIN",       chainAnchorStep(3, 2, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("unvouched bed -> RECHAIN",        chainAnchorStep(3, 1, 0) == CHAIN_ANCHOR_RECHAIN);
+    // Vouch/local mismatch is no vouch at all (edge moved on, copy did not).
+    CHECK("bed vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 1) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("chain vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 3) == CHAIN_ANCHOR_RECHAIN);
+
+    // No local furniture at all: the plain re-chain heal (lost/late ENTER).
+    CHECK("no furniture -> RECHAIN",          chainAnchorStep(3, 0, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("no furniture, stale vouch -> RECHAIN", chainAnchorStep(3, 0, 2) == CHAIN_ANCHOR_RECHAIN);
+}
+
+
+// ---- 11. Shared-wallet delta reconciliation (MoneyReconcile.h) ------------------
+// Guards the money-sync fix (2026-07-20): the player's real wallet is ONE shared
+// per-faction pool, so the channel replicates DELTAS and the peer ADDS them.
+// This locks: seed-is-silent, idle-is-silent, local delta detection + baseline
+// advance, remote delta apply + baseline advance (echo-guard), and the decisive
+// property - two CONCURRENT spends converge to the same total on both clients
+// (which absolute-value sync would corrupt).
+static void testMoneyReconcile() {
+    std::printf("== shared-wallet delta reconciliation (MoneyReconcile.h) ==\n");
+
+    // First sample seeds silently (no spurious delta at connect).
+    MoneyState s; int d = 12345;
+    CHECK("first sample seeds (no send)", !moneyLocalDelta(s, 1000, &d));
+    CHECK("seed sets baseline",           s.known == 1000);
+
+    // No change -> nothing to publish.
+    CHECK("idle wallet is silent", !moneyLocalDelta(s, 1000, &d));
+
+    // A local spend publishes a negative delta and advances the baseline.
+    CHECK("local spend detected",  moneyLocalDelta(s, 750, &d));
+    CHECK_EQ("spend delta = -250", (long long)d + 1000, 750); // d == -250
+    CHECK("baseline followed spend", s.known == 750);
+    CHECK("same wallet now idle",  !moneyLocalDelta(s, 750, &d));
+
+    // A remote delta is applied by ADDING it, and the baseline advances so the
+    // next local check does NOT echo it back.
+    int now = moneyApplyDelta(s, 750, -100); // peer spent 100
+    CHECK_EQ("apply subtracts",    now, 650);
+    CHECK("baseline followed apply", s.known == 650);
+    CHECK("applied delta not echoed", !moneyLocalDelta(s, 650, &d));
+
+    // The crux: two concurrent spends from a shared 1000 pool converge to 650 on
+    // BOTH clients (absolute-value sync would land one side on 750, the other on
+    // 900, losing money). A: local -250, then receives B's -100. B: local -100,
+    // then receives A's -250. Both must end at 650 with matching baselines.
+    MoneyState a; MoneyState b;
+    int da = 0, db = 0;
+    moneyLocalDelta(a, 1000, &da); // seed A
+    moneyLocalDelta(b, 1000, &db); // seed B
+    CHECK("A publishes its spend", moneyLocalDelta(a, 750, &da));  // da = -250
+    CHECK("B publishes its spend", moneyLocalDelta(b, 900, &db));  // db = -100
+    int aFinal = moneyApplyDelta(a, 750, db); // A applies B's -100
+    int bFinal = moneyApplyDelta(b, 900, da); // B applies A's -250
+    CHECK_EQ("A converges to 650", aFinal, 650);
+    CHECK_EQ("B converges to 650", bFinal, 650);
+    CHECK("A/B baselines agree",   a.known == b.known);
+    CHECK("baselines are 650",     a.known == 650);
+
+    // THE CLAMP FIX (2026-07-21): a remote delta that would drive the wallet
+    // negative is clamped to 0, and the baseline MUST follow the clamped value
+    // (0), NOT the theoretical delta. Otherwise 'known' goes negative, diverges
+    // from the real wallet, and the NEXT moneyLocalDelta reads cur(0)-known(<0)
+    // as a positive spurious delta - money printed from nothing, permanent desync.
+    //
+    // Repro: shared pool at 1000. This client (join) spends 800 locally (wallet
+    // 1000->200, baseline follows to 200 after publishing -800). Meanwhile the
+    // host spent 1000; that -1000 delta arrives here: 200 + (-1000) = -800 ->
+    // clamp to 0. Pre-fix, known landed at -800 (200 + (-1000)); post-fix it must
+    // land at 0 (the value actually written to the wallet).
+    {
+        MoneyState j; int jd = 0;
+        moneyLocalDelta(j, 1000, &jd);                 // seed at the shared 1000
+        CHECK("clamp: local spend of 800 detected", moneyLocalDelta(j, 200, &jd));
+        CHECK_EQ("clamp: local spend delta = -800", (long long)jd + 1000, 200); // jd == -800
+        CHECK("clamp: baseline followed local spend", j.known == 200);
+
+        // Host's -1000 arrives; 200 + (-1000) = -800 -> clamp to 0.
+        int applied = moneyApplyDelta(j, 200, -1000);
+        CHECK_EQ("clamp: wallet clamped to 0", applied, 0);
+        // THE ASSERTION THAT FAILS PRE-FIX: known must equal the real wallet (0),
+        // not the un-clamped theoretical baseline (-800).
+        CHECK("clamp: baseline follows clamped wallet (0), not theoretical (-800)",
+              j.known == 0);
+
+        // The decisive property: a subsequent publish must NOT fabricate a delta.
+        // Pre-fix, moneyLocalDelta(cur=0, known=-800) returned true with a +800
+        // spurious delta (money from nothing). Post-fix, cur==known==0 -> silent.
+        int spurious = 0;
+        CHECK("clamp: next publish emits NO phantom delta",
+              !moneyLocalDelta(j, 0, &spurious));
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1564,6 +1903,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testDriveTaper();
     testRoundTrips();
     testFraming();
     testSaveCrc();
@@ -1579,6 +1919,11 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testBounty();
+    testCarriedHeal();
+     testJailAnchor();
+    testStatusAutohide();
+    testMoneyReconcile();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
